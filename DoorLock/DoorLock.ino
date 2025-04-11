@@ -46,9 +46,9 @@ bool doorUnlocking = false;
 unsigned long lastOTACheck = 0;
 
 // Choose one:
-// const unsigned long otaInterval = 300000;    // every 5 minutes
+const unsigned long otaInterval = 300000;    // every 5 minutes
 // const unsigned long otaInterval = 10800000;  // every 3 hours
-const unsigned long otaInterval = 86400000;     // every 24 hours (midnight)
+//const unsigned long otaInterval = 86400000;     // every 24 hours (midnight)
 
 void setup() {
   Serial.begin(115200);
