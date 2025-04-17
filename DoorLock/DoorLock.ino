@@ -1,290 +1,348 @@
-//finalv4
+//finalv7 with ota updates
 #include <ESP8266WiFi.h>
 #include <WebSocketsClient.h>
 #include <ArduinoJson.h>
 #include <ESP8266HTTPClient.h>
-#include <ESP8266httpUpdate.h>
 #include <time.h>
+#include <PubSubClient.h>
 
+// ——— Async web server for OTA ———
+#include <ESPAsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+#include <ElegantOTA.h>
+// ————————————————————————————
+
+//
 // Pin Definitions
-#define RELAY D1
-#define BUZZER D8
-#define IR_SENSOR D2
-#define RED_LED D5
-#define GREEN_LED D6
+//
+#define RELAY       D1
+#define BUZZER      D8
+#define IR_SENSOR   D2
+#define RED_LED     D5
+#define GREEN_LED   D6
 #define DOOR_SENSOR D7
 
-// WiFi Credentials
-const char* ssid = "DataStream_2.4";
+//
+// Wi‑Fi Credentials
+//
+const char* ssid     = "DataStream_2.4";
 const char* password = "armmd123!@#";
 
-// Server Configuration
-const char* serverHost = "54.255.15.253";
-const int serverPort = 8081;
+//
+// Auth & WebSocket Server Config
+//
+const char* serverHost   = "54.255.15.253";
+const int   serverPort   = 8081;
 const char* authEndpoint = "/ws-auth";
-const char* wsPath = "/ws";
+const char* wsPath       = "/ws";
 
-// Auth Config
+//
+// Auth Payload
+//
 String apiKey = "K05uCc5QVyD2iA2WpU3kAaR6PLLFi6X4aBzdiit3xkQ=";
-int branchId = 1;
-int deviceId = 1;
+int branchId  = 1;
+int deviceId  = 1;
 
-// NTP Configuration
-const char* ntpServer = "pool.ntp.org";
-const long gmtOffset_sec = 19800;
-const int daylightOffset_sec = 0;
+//
+// NTP Config
+//
+const char* ntpServer         = "pool.ntp.org";
+const long  gmtOffset_sec     = 19800;
+const int   daylightOffset_sec = 0;
 
-// OTA Configuration
-String currentVersion = "1.0.0";
-String versionJsonURL = "https://northstarmv.github.io/DoorLock-OTA/firmware/version.json";
-
+//
+// WebSocket & Token
+//
 WebSocketsClient webSocket;
-String token = "";
-bool doorUnlocking = false;
+String token         = "";
+bool   doorUnlocking = false;
 
-// Timer for OTA
-unsigned long lastOTACheck = 0;
+//
+// Remote‑Debug MQTT (HiveMQ)
+//
+const char* debug_mqtt_server = "d681a6e1fecb4f01b1b5a72d2676e082.s1.eu.hivemq.cloud";
+const int   debug_mqtt_port   = 8883;
+const char* debug_mqtt_user   = "esplogger_1";
+const char* debug_mqtt_pass   = "Esplogger2025";
+const char* debugTopic        = "debug/log";
 
-// Choose one:
-const unsigned long otaInterval = 300000;    // every 5 minutes
-// const unsigned long otaInterval = 10800000;  // every 3 hours
-//const unsigned long otaInterval = 86400000;     // every 24 hours (midnight)
+WiFiClientSecure debugWiFiClient;
+PubSubClient     debugMqttClient(debugWiFiClient);
+
+//
+// OTA Web Server (Async)
+//
+AsyncWebServer httpServer(80);
+
+//
+// Helpers: Remote‑Debug Logging
+//
+void remoteDebugLog(const String &msg) {
+  Serial.println(msg);
+  if (debugMqttClient.connected()) {
+    debugMqttClient.publish(debugTopic, msg.c_str());
+  }
+}
+void doorLog(const String &msg) { remoteDebugLog(msg); }
+
+void connectToDebugMQTT() {
+  debugWiFiClient.setInsecure();
+  debugMqttClient.setServer(debug_mqtt_server, debug_mqtt_port);
+  while (!debugMqttClient.connected()) {
+    Serial.println("[DEBUG] Connecting to debug MQTT...");
+    if (debugMqttClient.connect("esp8266-debug",
+                                debug_mqtt_user,
+                                debug_mqtt_pass)) {
+      Serial.println("[DEBUG] Debug MQTT connected");
+    } else {
+      Serial.println("[DEBUG] Debug MQTT failed; retrying in 5s");
+      delay(5000);
+    }
+  }
+}
+
+// Forward decls
+bool   getToken();
+void   startWebSocket();
+void   unlockDoor();
+void   lockDoorAndConfirm();
+bool   isDoorClosed();
+void   sendDoorOpened();
+void   sendDoorClosed();
+void   playBeep();
+String getTimestamp();
+void   webSocketEvent(WStype_t type, uint8_t *payload, size_t length);
 
 void setup() {
   Serial.begin(115200);
-  delay(1000);
+  delay(500);
 
+  // Pins
   pinMode(RELAY, OUTPUT);
   pinMode(BUZZER, OUTPUT);
   pinMode(IR_SENSOR, INPUT_PULLUP);
   pinMode(RED_LED, OUTPUT);
   pinMode(GREEN_LED, OUTPUT);
   pinMode(DOOR_SENSOR, INPUT_PULLUP);
-
   digitalWrite(RELAY, HIGH);
   digitalWrite(RED_LED, HIGH);
   digitalWrite(GREEN_LED, LOW);
 
-  Serial.println("\n🔧 Booting...");
+  Serial.println("\n🔧 MAIN APP Booting...");
+
+  // Wi‑Fi (renamed so you know this arrived OTA)
+  Serial.printf("📡 [OTA APP] Connecting to WiFi: %s\n", ssid);
+  WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
   while (WiFi.status() != WL_CONNECTED) {
-    delay(500); Serial.print(".");
+    delay(500);
+    Serial.print(".");
   }
-  Serial.printf("\n✅ Connected! IP: %s\n", WiFi.localIP().toString().c_str());
+  Serial.printf("\n✅ [OTA APP] IP: %s\n",
+                WiFi.localIP().toString().c_str());
 
+  // Debug MQTT
+  connectToDebugMQTT();
+  remoteDebugLog("[DEBUG] Remote debug MQTT connected");
+
+  // NTP sync
   configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
-  while (!getLocalTime(nullptr)) {
-    Serial.println("⏱ Waiting for time...");
+  remoteDebugLog("⏱ Waiting for NTP…");
+  struct tm ti;
+  while (!getLocalTime(&ti)) {
+    remoteDebugLog("❌ NTP failed; retrying…");
     delay(1000);
   }
+  remoteDebugLog("✅ NTP synced");
 
-  if (getToken()) startWebSocket();
-  else ESP.restart();
+  // ————— ElegantOTA setup —————
+  // no extra routes needed: /update is exposed by the library
+  httpServer.begin();
+  ElegantOTA.begin(&httpServer);
+  remoteDebugLog("📡 OTA UI available: http://" +
+                 WiFi.localIP().toString() + "/update");
+  // ————————————————————————————
+
+  // Token & WebSocket
+  if (getToken()) {
+    startWebSocket();
+  } else {
+    remoteDebugLog("❌ Token fetch failed; restarting");
+    delay(1000);
+    ESP.restart();
+  }
 }
 
 void loop() {
-  webSocket.loop();
+  // Keep OTA portal alive
+  ElegantOTA.loop();
 
+  // Process WebSocket & MQTT
+  webSocket.loop();
+  debugMqttClient.loop();
+
+  // IR-triggered door unlock
   if (!doorUnlocking && digitalRead(IR_SENSOR) == LOW) {
-    Serial.println("🚪 IR Sensor Triggered - Unlocking");
+    doorLog("🚪 IR Sensor Triggered - Unlocking");
     doorUnlocking = true;
     unlockDoor();
     doorUnlocking = false;
   }
-
-  if (millis() - lastOTACheck > otaInterval) {
-    lastOTACheck = millis();
-    checkForOTAUpdate();
-  }
 }
 
+// -----------------------------------------------------
+// Door Logic & Logging
+// -----------------------------------------------------
 bool isDoorClosed() {
-  int state = digitalRead(DOOR_SENSOR);
-  Serial.printf("🔍 Door Sensor State: %d (%s)\n", state, state == LOW ? "CLOSED" : "OPEN");
-  return state == LOW;
+  int s = digitalRead(DOOR_SENSOR);
+  doorLog("🔍 Door: " + String(s) + (s==LOW? " CLOSED":" OPEN"));
+  return s == LOW;
 }
 
 void unlockDoor() {
-  Serial.println("🔓 Unlocking door...");
+  doorLog("🔓 Unlock door");
   digitalWrite(RELAY, LOW);
   digitalWrite(GREEN_LED, HIGH);
   digitalWrite(RED_LED, LOW);
   playBeep();
 
-  Serial.println("⏳ Waiting for door to open...");
-  unsigned long startTime = millis();
+  doorLog("⏳ Waiting open…");
+  unsigned long st = millis();
   while (isDoorClosed()) {
-    if (millis() - startTime > 10000) {
-      Serial.println("⌛ Timeout: Door not opened. Re-locking...");
+    if (millis() - st > 10000) {
+      doorLog("⌛ Timeout; re-lock");
       lockDoorAndConfirm();
       return;
     }
     delay(300);
   }
-
-  Serial.println("✅ Door opened (magnet separated)");
+  doorLog("✅ Opened");
   sendDoorOpened();
 
-  Serial.println("⏳ Waiting for door to close...");
+  doorLog("⏳ Waiting close…");
   while (!isDoorClosed()) delay(300);
-  Serial.println("✅ Door closed (magnet contact)");
+  doorLog("✅ Closed");
   lockDoorAndConfirm();
 }
 
 void lockDoorAndConfirm() {
-  Serial.println("🔒 Locking door...");
+  doorLog("🔒 Lock door");
   digitalWrite(RELAY, HIGH);
   digitalWrite(GREEN_LED, LOW);
   digitalWrite(RED_LED, HIGH);
   sendDoorClosed();
 }
 
-void playBeep() {
-  for (int i = 0; i < 3; i++) {
-    digitalWrite(BUZZER, HIGH); delay(100);
-    digitalWrite(BUZZER, LOW); delay(100);
-  }
-}
-
 void sendDoorClosed() {
-  DynamicJsonDocument doc(128);
-  doc["msgType"] = "isunlock";
-  JsonObject data = doc.createNestedObject("data");
-  data["isUnlock"] = false;
-  data["timestamp"] = getTimestamp();
-
-  String msg;
-  serializeJson(doc, msg);
-  webSocket.sendTXT(msg);
-  Serial.println("📤 Sent door closed event to server: " + msg);
+  DynamicJsonDocument d(128);
+  d["msgType"] = "isunlock";
+  auto o = d.createNestedObject("data");
+  o["isUnlock"] = false;
+  o["timestamp"] = getTimestamp();
+  String m; serializeJson(d, m);
+  webSocket.sendTXT(m);
+  doorLog("📤 Closed: " + m);
 }
 
 void sendDoorOpened() {
-  DynamicJsonDocument doc(128);
-  doc["msgType"] = "isunlock";
-  JsonObject data = doc.createNestedObject("data");
-  data["isUnlock"] = true;
-  data["timestamp"] = getTimestamp();
-
-  String msg;
-  serializeJson(doc, msg);
-  webSocket.sendTXT(msg);
-  Serial.println("📤 Sent door OPENED event to server: " + msg);
+  DynamicJsonDocument d(128);
+  d["msgType"] = "isunlock";
+  auto o = d.createNestedObject("data");
+  o["isUnlock"] = true;
+  o["timestamp"] = getTimestamp();
+  String m; serializeJson(d, m);
+  webSocket.sendTXT(m);
+  doorLog("📤 Opened: " + m);
 }
 
-String getTimestamp() {
-  struct tm timeinfo;
-  if (!getLocalTime(&timeinfo)) return "2025-04-10T00:00:00Z";
-  char isoTime[30];
-  strftime(isoTime, sizeof(isoTime), "%Y-%m-%dT%H:%M:%SZ", &timeinfo);
-  return String(isoTime);
+void playBeep() {
+  for (int i = 0; i < 3; i++) {
+    digitalWrite(BUZZER, HIGH); delay(100);
+    digitalWrite(BUZZER, LOW);  delay(100);
+  }
 }
 
+// -----------------------------------------------------
+// WebSocket Callback
+// -----------------------------------------------------
 void webSocketEvent(WStype_t type, uint8_t *payload, size_t length) {
-  if (type == WStype_CONNECTED) Serial.println("🔗 WebSocket connected");
-  else if (type == WStype_TEXT) {
-    Serial.printf("📩 Message: %s\n", (char*)payload);
-    if (String((char*)payload).indexOf("door unlocked") >= 0) unlockDoor();
+  switch (type) {
+    case WStype_CONNECTED:
+      doorLog("🔗 WS connected");
+      break;
+    case WStype_TEXT: {
+      String msg; msg.reserve(length);
+      for (size_t i = 0; i < length; i++) msg += (char)payload[i];
+      doorLog("📩 WS msg: " + msg);
+      if (msg.indexOf("door unlocked") >= 0) unlockDoor();
+      break;
+    }
+    case WStype_DISCONNECTED:
+      doorLog("⚠️ WS disconnected; retry in 1m");
+      delay(60000);
+      if (getToken()) startWebSocket();
+      break;
+    case WStype_ERROR:
+      doorLog("❌ WS error");
+      break;
   }
-  else if (type == WStype_DISCONNECTED) {
-    Serial.println("⚠️ WebSocket disconnected. Waiting 1 min to retry...");
-    delay(60000);
-    if (getToken()) startWebSocket();
-  }
-  else if (type == WStype_ERROR) Serial.println("❌ WebSocket Error!");
 }
 
+// -----------------------------------------------------
+// HTTP Token Request
+// -----------------------------------------------------
 bool getToken() {
   WiFiClient client;
   HTTPClient http;
   String url = String("http://") + serverHost + ":" + serverPort + authEndpoint;
-
   http.begin(client, url);
   http.addHeader("Content-Type", "application/json");
 
-  DynamicJsonDocument body(256);
-  body["connType"] = "door-lock";
-  body["id"] = deviceId;
-  body["connId"] = JsonArray();
-  body["apiKey"] = apiKey;
-  body["branchId"] = branchId;
+  DynamicJsonDocument b(256);
+  b["connType"]="door-lock";
+  b["id"]=deviceId;
+  b["connId"]=JsonArray();
+  b["apiKey"]=apiKey;
+  b["branchId"]=branchId;
+  String body; serializeJson(b, body);
+  remoteDebugLog("🔑 Token req: " + body);
 
-  String requestBody;
-  serializeJson(body, requestBody);
-  Serial.print("\n🔑 Sending token request: ");
-  Serial.println(requestBody);
-
-  int httpCode = http.POST(requestBody);
-  if (httpCode == 200) {
-    String response = http.getString();
-    DynamicJsonDocument responseDoc(256);
-    deserializeJson(responseDoc, response);
-    if (responseDoc.containsKey("token")) {
-      token = responseDoc["token"].as<String>();
-      Serial.println("🔐 Parsed token: " + token);
+  int code = http.POST(body);
+  if (code==200) {
+    String r = http.getString();
+    remoteDebugLog("✅ Token resp: " + r);
+    DynamicJsonDocument js(256);
+    if (!deserializeJson(js, r) && js.containsKey("token")) {
+      token = js["token"].as<String>();
+      remoteDebugLog("🔐 Token: " + token);
+      http.end();
       return true;
     }
+    remoteDebugLog("❌ Token parse error");
+  } else {
+    remoteDebugLog("❌ Token fail, code: " + String(code));
   }
+  http.end();
   return false;
 }
 
 void startWebSocket() {
-  String fullPath = String(wsPath) + "?token=" + token;
-  Serial.print("🔌 Connecting to WebSocket at: ");
-  Serial.println("ws://" + String(serverHost) + ":" + String(serverPort) + fullPath);
-  webSocket.begin(serverHost, serverPort, fullPath);
+  String p = String(wsPath) + "?token=" + token;
+  doorLog("🔌 WS connect: " + p);
+  webSocket.begin(serverHost, serverPort, p);
   webSocket.onEvent(webSocketEvent);
   webSocket.setReconnectInterval(5000);
 }
 
-void checkForOTAUpdate() {
-  Serial.println("🛠️ Checking for OTA update...");
-  WiFiClient client;
-  HTTPClient http;
-
-  if (!http.begin(client, versionJsonURL)) {
-    Serial.println("❌ Failed to connect to version.json");
-    return;
-  }
-
-  int httpCode = http.GET();
-  if (httpCode != 200) {
-    Serial.printf("❌ HTTP GET failed: %d\n", httpCode);
-    return;
-  }
-
-  String payload = http.getString();
-  DynamicJsonDocument doc(512);
-  DeserializationError error = deserializeJson(doc, payload);
-  if (error) {
-    Serial.println("❌ Failed to parse JSON");
-    return;
-  }
-
-  String latestVersion = doc["version"];
-  String binURL = doc["bin"];
-
-  Serial.println("🔍 Current version: " + currentVersion + ", Latest: " + latestVersion);
-
-  if (latestVersion != currentVersion) {
-    Serial.println("⬇️ New version available. Starting OTA...");
-    t_httpUpdate_return ret = ESPhttpUpdate.update(client, binURL, currentVersion);
-    switch (ret) {
-      case HTTP_UPDATE_FAILED:
-        Serial.printf("❌ OTA Failed: %s\n", ESPhttpUpdate.getLastErrorString().c_str());
-        break;
-      case HTTP_UPDATE_NO_UPDATES:
-        Serial.println("ℹ️ No new updates.");
-        break;
-      case HTTP_UPDATE_OK:
-        Serial.println("✅ OTA Update successful. Restarting...");
-        break;
-    }
-  } else {
-    Serial.println("✅ Already on latest version.");
-  }
-
-  http.end();
+// -----------------------------------------------------
+// ISO Timestamp Utility
+// -----------------------------------------------------
+String getTimestamp() {
+  struct tm ti;
+  if (!getLocalTime(&ti)) return "2025-04-10T00:00:00Z";
+  char buf[30];
+  strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &ti);
+  return String(buf);
 }
 
 
@@ -298,6 +356,1130 @@ void checkForOTAUpdate() {
 
 
 
+//ota initial code
+// #include <ESP8266WiFi.h>
+// #include <ESPAsyncTCP.h>
+// #include <ESPAsyncWebServer.h>
+// #include <ElegantOTA.h>
+
+// const char* ssid     = "DataStream_2.4";
+// const char* password = "armmd123!@#";
+
+// // Async server for OTA portal
+// AsyncWebServer server(80);
+
+// void setup() {
+//   Serial.begin(115200);
+//   delay(500);
+//   Serial.println("\n🔧 OTA STUB Booting...");
+
+//   Serial.printf("📡 [OTA STUB] WiFi: %s\n", ssid);
+//   WiFi.mode(WIFI_STA);
+//   WiFi.begin(ssid, password);
+//   while (WiFi.status() != WL_CONNECTED) {
+//     delay(500);
+//     Serial.print(".");
+//   }
+//   Serial.printf("\n✅ [OTA STUB] IP: %s\n",
+//                 WiFi.localIP().toString().c_str());
+
+//   // Minimal root so you know the stub is alive
+//   server.on("/", HTTP_GET, [](AsyncWebServerRequest *req){
+//     req->send(200, "text/plain", "OTA Stub Running");
+//   });
+
+//   server.begin();
+//   Serial.println("✔ [OTA STUB] HTTP server started");
+
+//   // Enable ElegantOTA UI
+//   ElegantOTA.begin(&server);
+//   Serial.println("✔ [OTA STUB] ElegantOTA → http://" 
+//                  + WiFi.localIP().toString() + "/update");
+// }
+
+// void loop() {
+//   // Required to keep OTA portal alive
+//   ElegantOTA.loop();
+// }
+
+
+
+
+
+
+
+
+
+
+
+
+//finalv6 with working debug log and other features
+// #include <ESP8266WiFi.h>
+// #include <WebSocketsClient.h>
+// #include <ArduinoJson.h>
+// #include <ESP8266HTTPClient.h>
+// #include <time.h>
+// #include <PubSubClient.h>  // For remote debug MQTT
+
+// // -----------------------------------------------------
+// // Pin Definitions (unchanged from finalv3)
+// // -----------------------------------------------------
+// #define RELAY       D1
+// #define BUZZER      D8
+// #define IR_SENSOR   D2
+// #define RED_LED     D5
+// #define GREEN_LED   D6
+// #define DOOR_SENSOR D7
+
+// // -----------------------------------------------------
+// // WiFi Credentials
+// // -----------------------------------------------------
+// const char* ssid     = "DataStream_2.4";
+// const char* password = "armmd123!@#";
+
+// // -----------------------------------------------------
+// // Server Configuration (for auth and WebSocket)
+// // -----------------------------------------------------
+// const char* serverHost   = "54.255.15.253";
+// const int   serverPort   = 8081;
+// const char* authEndpoint = "/ws-auth";
+// const char* wsPath       = "/ws";
+
+// // -----------------------------------------------------
+// // Auth Config (for token request)
+// // -----------------------------------------------------
+// String apiKey = "K05uCc5QVyD2iA2WpU3kAaR6PLLFi6X4aBzdiit3xkQ=";
+// int branchId  = 1;
+// int deviceId  = 1;
+
+// // -----------------------------------------------------
+// // NTP Configuration
+// // -----------------------------------------------------
+// const char* ntpServer       = "pool.ntp.org";
+// const long gmtOffset_sec    = 19800;
+// const int  daylightOffset_sec = 0;
+
+// // -----------------------------------------------------
+// // WebSocket Variables (finalv3 code)
+// // -----------------------------------------------------
+// WebSocketsClient webSocket;
+// String token = "";
+// bool doorUnlocking = false;
+
+// // -----------------------------------------------------
+// // Remote Debug MQTT Configuration
+// // (Using the HiveMQ broker credentials)
+// // -----------------------------------------------------
+// const char* debug_mqtt_server = "d681a6e1fecb4f01b1b5a72d2676e082.s1.eu.hivemq.cloud";
+// const int   debug_mqtt_port   = 8883;
+// const char* debug_mqtt_user   = "esplogger_1";
+// const char* debug_mqtt_pass   = "Esplogger2025";
+// const char* debugTopic        = "debug/log";
+
+// WiFiClientSecure debugWiFiClient;
+// PubSubClient debugMqttClient(debugWiFiClient);
+
+// // -----------------------------------------------------
+// // Remote Debug Setup and Helper Functions
+// // -----------------------------------------------------
+// void connectToDebugMQTT() {
+//   debugWiFiClient.setInsecure(); // Accept server certificate without verification
+//   debugMqttClient.setServer(debug_mqtt_server, debug_mqtt_port);
+//   while (!debugMqttClient.connected()) {
+//     Serial.println("[DEBUG] Connecting to debug MQTT...");
+//     if (debugMqttClient.connect("esp8266-debug", debug_mqtt_user, debug_mqtt_pass)) {
+//       Serial.println("[DEBUG] Debug MQTT connected");
+//     } else {
+//       Serial.println("[DEBUG] Debug MQTT connection failed. Retrying in 5s...");
+//       delay(5000);
+//     }
+//   }
+// }
+
+// // This function sends a log message both to Serial and to the remote debug topic.
+// void remoteDebugLog(const String &msg) {
+//   Serial.println(msg);  // Print locally
+//   if (debugMqttClient.connected()) {
+//     bool success = debugMqttClient.publish(debugTopic, msg.c_str());
+//     if (!success) {
+//       Serial.println("[DEBUG] Publish to debug/log failed!");
+//     }
+//   }
+// }
+
+// // A helper for door and event messages.
+// void doorLog(const String &msg) {
+//   remoteDebugLog(msg);
+// }
+
+// // -----------------------------------------------------
+// // Original finalv3 Setup with Remote Debug Integration
+// // -----------------------------------------------------
+// void setup() {
+//   Serial.begin(115200);
+//   delay(1000);
+
+//   // Set Pin Modes
+//   pinMode(RELAY, OUTPUT);
+//   pinMode(BUZZER, OUTPUT);
+//   pinMode(IR_SENSOR, INPUT_PULLUP);
+//   pinMode(RED_LED, OUTPUT);
+//   pinMode(GREEN_LED, OUTPUT);
+//   pinMode(DOOR_SENSOR, INPUT_PULLUP);
+
+//   digitalWrite(RELAY, HIGH);
+//   digitalWrite(RED_LED, HIGH);
+//   digitalWrite(GREEN_LED, LOW);
+
+//   Serial.println("\n🔧 Booting...");
+
+//   // Connect to WiFi
+//   Serial.printf("📡 Connecting to WiFi: %s\n", ssid);
+//   WiFi.begin(ssid, password);
+//   while (WiFi.status() != WL_CONNECTED) {
+//     delay(500);
+//     Serial.print(".");
+//   }
+//   Serial.printf("\n✅ Connected! IP: %s\n", WiFi.localIP().toString().c_str());
+
+//   // Connect to remote debug MQTT
+//   connectToDebugMQTT();
+//   remoteDebugLog("[DEBUG] Remote debug MQTT connected");
+
+//   // Set up NTP time
+//   configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+//   remoteDebugLog("⏱ Waiting for NTP time...");
+//   struct tm timeinfo;
+//   while (!getLocalTime(&timeinfo)) {
+//     remoteDebugLog("❌ Failed to get time, retrying...");
+//     delay(1000);
+//   }
+//   remoteDebugLog("✅ Time synchronized");
+
+//   // Get token and start WebSocket
+//   if (getToken()) {
+//     startWebSocket();
+//   } else {
+//     remoteDebugLog("❌ Failed to get token. Restarting...");
+//     delay(1000);
+//     ESP.restart();
+//   }
+// }
+
+// // -----------------------------------------------------
+// // Finalv3 Loop (Door events only; Free heap messages are not published remotely)
+// // -----------------------------------------------------
+// void loop() {
+//   webSocket.loop();
+//   debugMqttClient.loop();  // Maintain debug MQTT connection
+
+//   // Process door unlocking via IR sensor trigger
+//   if (!doorUnlocking && digitalRead(IR_SENSOR) == LOW) {
+//     doorLog("🚪 IR Sensor Triggered - Unlocking");
+//     doorUnlocking = true;
+//     unlockDoor();
+//     doorUnlocking = false;
+//   }
+// }
+
+// // -----------------------------------------------------
+// // Door Control and Logging
+// // -----------------------------------------------------
+// bool isDoorClosed() {
+//   int state = digitalRead(DOOR_SENSOR);
+//   doorLog("🔍 Door Sensor State: " + String(state) + " (" + (state == LOW ? "CLOSED" : "OPEN") + ")");
+//   return state == LOW;
+// }
+
+// void unlockDoor() {
+//   doorLog("🔓 Unlocking door...");
+//   digitalWrite(RELAY, LOW);
+//   digitalWrite(GREEN_LED, HIGH);
+//   digitalWrite(RED_LED, LOW);
+//   playBeep();
+
+//   doorLog("⏳ Waiting for door to open...");
+//   unsigned long startTime = millis();
+//   while (isDoorClosed()) {
+//     if (millis() - startTime > 10000) {
+//       doorLog("⌛ Timeout: Door not opened. Re-locking...");
+//       lockDoorAndConfirm();
+//       return;
+//     }
+//     delay(300);
+//   }
+//   doorLog("✅ Door opened (magnet separated)");
+//   sendDoorOpened();
+
+//   doorLog("⏳ Waiting for door to close...");
+//   while (!isDoorClosed()) {
+//     delay(300);
+//   }
+//   doorLog("✅ Door closed (magnet contact)");
+//   lockDoorAndConfirm();
+// }
+
+// void lockDoorAndConfirm() {
+//   doorLog("🔒 Locking door...");
+//   digitalWrite(RELAY, HIGH);
+//   digitalWrite(GREEN_LED, LOW);
+//   digitalWrite(RED_LED, HIGH);
+//   sendDoorClosed();
+// }
+
+// // -----------------------------------------------------
+// // JSON Messages for Door State
+// // -----------------------------------------------------
+// void sendDoorClosed() {
+//   DynamicJsonDocument doc(128);
+//   doc["msgType"] = "isunlock";
+//   JsonObject data = doc.createNestedObject("data");
+//   data["isUnlock"] = false;
+//   data["timestamp"] = getTimestamp();
+
+//   String msg;
+//   serializeJson(doc, msg);
+//   webSocket.sendTXT(msg);
+//   doorLog("📤 Sent door closed event to server: " + msg);
+// }
+
+// void sendDoorOpened() {
+//   DynamicJsonDocument doc(128);
+//   doc["msgType"] = "isunlock";
+//   JsonObject data = doc.createNestedObject("data");
+//   data["isUnlock"] = true;
+//   data["timestamp"] = getTimestamp();
+
+//   String msg;
+//   serializeJson(doc, msg);
+//   webSocket.sendTXT(msg);
+//   doorLog("📤 Sent door OPENED event to server: " + msg);
+// }
+
+// // -----------------------------------------------------
+// // Buzzer Beep Function
+// // -----------------------------------------------------
+// void playBeep() {
+//   for (int i = 0; i < 3; i++) {
+//     digitalWrite(BUZZER, HIGH);
+//     delay(100);
+//     digitalWrite(BUZZER, LOW);
+//     delay(100);
+//   }
+// }
+
+// // -----------------------------------------------------
+// // WebSocket Callback Function
+// // -----------------------------------------------------
+// void webSocketEvent(WStype_t type, uint8_t *payload, size_t length) {
+//   switch (type) {
+//     case WStype_CONNECTED:
+//       doorLog("🔗 WebSocket connected");
+//       break;
+//     case WStype_TEXT:
+//     {
+//       String incomingMsg;
+//       incomingMsg.reserve(length);
+//       for (size_t i = 0; i < length; i++) {
+//         incomingMsg += (char)payload[i];
+//       }
+//       doorLog("📩 Message: " + incomingMsg);
+//       if (incomingMsg.indexOf("door unlocked") >= 0) {
+//         unlockDoor();
+//       }
+//       break;
+//     }
+//     case WStype_DISCONNECTED:
+//       doorLog("⚠️ WebSocket disconnected. Waiting 1 min to retry...");
+//       delay(60000);
+//       if (getToken()) startWebSocket();
+//       break;
+//     case WStype_ERROR:
+//       doorLog("❌ WebSocket Error!");
+//       break;
+//     default:
+//       doorLog("ℹ️ WebSocket Event Type: " + String(type));
+//       break;
+//   }
+// }
+
+// // -----------------------------------------------------
+// // HTTP Token Request
+// // -----------------------------------------------------
+// bool getToken() {
+//   WiFiClient client;
+//   HTTPClient http;
+
+//   String url = String("http://") + serverHost + ":" + serverPort + authEndpoint;
+//   http.begin(client, url);
+//   http.addHeader("Content-Type", "application/json");
+
+//   DynamicJsonDocument body(256);
+//   body["connType"] = "door-lock";
+//   body["id"] = deviceId;
+//   body["connId"] = JsonArray();
+//   body["apiKey"] = apiKey;
+//   body["branchId"] = branchId;
+
+//   String requestBody;
+//   serializeJson(body, requestBody);
+//   remoteDebugLog("\n🔑 Sending token request: " + requestBody);
+
+//   int httpCode = http.POST(requestBody);
+//   if (httpCode == 200) {
+//     String response = http.getString();
+//     remoteDebugLog("✅ Token response: " + response);
+
+//     DynamicJsonDocument responseDoc(256);
+//     DeserializationError error = deserializeJson(responseDoc, response);
+//     if (!error && responseDoc.containsKey("token")) {
+//       token = responseDoc["token"].as<String>();
+//       remoteDebugLog("🔐 Parsed token: " + token);
+//       http.end();
+//       return true;
+//     } else {
+//       remoteDebugLog("❌ Token parse error");
+//     }
+//   } else {
+//     remoteDebugLog("❌ HTTP POST failed, code: " + String(httpCode));
+//   }
+
+//   http.end();
+//   return false;
+// }
+
+// void startWebSocket() {
+//   String fullPath = String(wsPath) + "?token=" + token;
+//   doorLog("🔌 Connecting to WebSocket at: ws://" + String(serverHost) + ":" + String(serverPort) + fullPath);
+
+//   webSocket.begin(serverHost, serverPort, fullPath);
+//   webSocket.onEvent(webSocketEvent);
+//   webSocket.setReconnectInterval(5000);
+// }
+
+// // -----------------------------------------------------
+// // Get Timestamp in ISO Format
+// // -----------------------------------------------------
+// String getTimestamp() {
+//   struct tm timeinfo;
+//   if (!getLocalTime(&timeinfo)) {
+//     doorLog("⚠️ Failed to get local time. Using fallback.");
+//     return "2025-04-10T00:00:00Z";
+//   }
+//   char isoTime[30];
+//   strftime(isoTime, sizeof(isoTime), "%Y-%m-%dT%H:%M:%SZ", &timeinfo);
+//   return String(isoTime);
+// }
+
+
+
+
+
+
+
+
+
+
+
+
+
+//finalv5
+// #include <ESP8266WiFi.h>
+// #include <WebSocketsClient.h>
+// #include <ArduinoJson.h>
+// #include <ESP8266HTTPClient.h>
+// #include <time.h>
+// #include <PubSubClient.h>  // For remote debug MQTT
+
+// // -----------------------------------------------------
+// // Pin Definitions (unchanged from finalv3)
+// // -----------------------------------------------------
+// #define RELAY       D1
+// #define BUZZER      D8
+// #define IR_SENSOR   D2
+// #define RED_LED     D5
+// #define GREEN_LED   D6
+// #define DOOR_SENSOR D7
+
+// // -----------------------------------------------------
+// // WiFi Credentials
+// // -----------------------------------------------------
+// const char* ssid     = "DataStream_2.4";
+// const char* password = "armmd123!@#";
+
+// // -----------------------------------------------------
+// // Server Configuration (for auth and WebSocket)
+// // -----------------------------------------------------
+// const char* serverHost   = "54.255.15.253";
+// const int   serverPort   = 8081;
+// const char* authEndpoint = "/ws-auth";
+// const char* wsPath       = "/ws";
+
+// // -----------------------------------------------------
+// // Auth Config (for token request)
+// // -----------------------------------------------------
+// String apiKey = "K05uCc5QVyD2iA2WpU3kAaR6PLLFi6X4aBzdiit3xkQ=";
+// int branchId  = 1;
+// int deviceId  = 1;
+
+// // -----------------------------------------------------
+// // NTP Configuration
+// // -----------------------------------------------------
+// const char* ntpServer       = "pool.ntp.org";
+// const long gmtOffset_sec    = 19800;
+// const int daylightOffset_sec = 0;
+
+// // -----------------------------------------------------
+// // Global Variables for WebSocket (finalv3 code)
+// // -----------------------------------------------------
+// WebSocketsClient webSocket;
+// String token = "";
+// bool doorUnlocking = false;
+
+// // -----------------------------------------------------
+// // Remote Debug MQTT Configuration
+// // We use the same HiveMQ server but a separate topic "debug/log"
+// // -----------------------------------------------------
+// const char* debug_mqtt_server = "d681a6e1fecb4f01b1b5a72d2676e082.s1.eu.hivemq.cloud";
+// const int   debug_mqtt_port   = 8883;
+// const char* debug_mqtt_user   = "esplogger_1";
+// const char* debug_mqtt_pass   = "Esplogger2025";
+// const char* debugTopic        = "debug/log";
+
+// WiFiClientSecure debugWiFiClient;
+// PubSubClient debugMqttClient(debugWiFiClient);
+
+// // -----------------------------------------------------
+// // Global variable for remote debug free heap logging
+// // -----------------------------------------------------
+// unsigned long lastHeapPrint = 0;
+
+// // -----------------------------------------------------
+// // Remote Debug Functions
+// // -----------------------------------------------------
+
+// // Connect to the debug MQTT broker.
+// void connectToDebugMQTT() {
+//   debugWiFiClient.setInsecure(); // Accept server cert without verification
+//   debugMqttClient.setServer(debug_mqtt_server, debug_mqtt_port);
+//   while (!debugMqttClient.connected()) {
+//     Serial.println("[DEBUG] Connecting to debug MQTT...");
+//     if (debugMqttClient.connect("esp8266-debug", debug_mqtt_user, debug_mqtt_pass)) {
+//       Serial.println("[DEBUG] Debug MQTT connected");
+//     } else {
+//       Serial.println("[DEBUG] Debug MQTT connection failed. Retrying in 5s...");
+//       delay(5000);
+//     }
+//   }
+// }
+
+// // Remote debug log function with publish check.
+// void remoteDebugLog(String msg) {
+//   Serial.println(msg);
+//   if (debugMqttClient.connected()) {
+//     bool success = debugMqttClient.publish(debugTopic, msg.c_str());
+//     if (!success) {
+//       Serial.println("[DEBUG] Publish to debug/log failed!");
+//     }
+//   }
+// }
+
+// // -----------------------------------------------------
+// // Original finalv3 Code (unchanged except for added debug calls)
+// // -----------------------------------------------------
+
+// void setup() {
+//   Serial.begin(115200);
+//   delay(1000);
+
+//   // Set Pin Modes
+//   pinMode(RELAY, OUTPUT);
+//   pinMode(BUZZER, OUTPUT);
+//   pinMode(IR_SENSOR, INPUT_PULLUP);
+//   pinMode(RED_LED, OUTPUT);
+//   pinMode(GREEN_LED, OUTPUT);
+//   pinMode(DOOR_SENSOR, INPUT_PULLUP);
+
+//   digitalWrite(RELAY, HIGH);
+//   digitalWrite(RED_LED, HIGH);
+//   digitalWrite(GREEN_LED, LOW);
+
+//   Serial.println("\n🔧 Booting...");
+  
+//   // Connect to WiFi
+//   Serial.printf("📡 Connecting to WiFi: %s\n", ssid);
+//   WiFi.begin(ssid, password);
+//   while (WiFi.status() != WL_CONNECTED) {
+//     delay(500);
+//     Serial.print(".");
+//   }
+//   Serial.printf("\n✅ Connected! IP: %s\n", WiFi.localIP().toString().c_str());
+
+//   // Connect to remote debug MQTT
+//   connectToDebugMQTT();
+//   remoteDebugLog("[DEBUG] Remote debug MQTT connected");
+
+//   // Set up NTP time
+//   configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+//   Serial.println("⏱ Waiting for NTP time...");
+//   struct tm timeinfo;
+//   while (!getLocalTime(&timeinfo)) {
+//     Serial.println("❌ Failed to get time, retrying...");
+//     delay(1000);
+//   }
+//   Serial.println("✅ Time synchronized");
+
+//   if (getToken()) {
+//     startWebSocket();
+//   } else {
+//     Serial.println("❌ Failed to get token. Restarting...");
+//     delay(1000);
+//     ESP.restart();
+//   }
+// }
+
+// void loop() {
+//   webSocket.loop();
+//   debugMqttClient.loop(); // Maintain remote debug MQTT connection
+
+//   // Every 5 seconds, send free heap value via remote debug
+//   if (millis() - lastHeapPrint > 5000) {
+//     remoteDebugLog("[DEBUG] Free heap: " + String(ESP.getFreeHeap()));
+//     lastHeapPrint = millis();
+//   }
+
+//   if (!doorUnlocking && digitalRead(IR_SENSOR) == LOW) {
+//     Serial.println("🚪 IR Sensor Triggered - Unlocking");
+//     doorUnlocking = true;
+//     unlockDoor();
+//     doorUnlocking = false;
+//   }
+// }
+
+// bool isDoorClosed() {
+//   int state = digitalRead(DOOR_SENSOR);
+//   Serial.printf("🔍 Door Sensor State: %d (%s)\n", state, state == LOW ? "CLOSED" : "OPEN");
+//   return state == LOW;
+// }
+
+// void unlockDoor() {
+//   Serial.println("🔓 Unlocking door...");
+//   digitalWrite(RELAY, LOW);
+//   digitalWrite(GREEN_LED, HIGH);
+//   digitalWrite(RED_LED, LOW);
+//   playBeep();
+
+//   Serial.println("⏳ Waiting for door to open...");
+//   unsigned long startTime = millis();
+//   while (isDoorClosed()) {
+//     if (millis() - startTime > 10000) {
+//       Serial.println("⌛ Timeout: Door not opened. Re-locking...");
+//       lockDoorAndConfirm();
+//       return;
+//     }
+//     delay(300);
+//   }
+//   Serial.println("✅ Door opened (magnet separated)");
+//   sendDoorOpened();
+
+//   Serial.println("⏳ Waiting for door to close...");
+//   while (!isDoorClosed()) {
+//     delay(300);
+//   }
+//   Serial.println("✅ Door closed (magnet contact)");
+//   lockDoorAndConfirm();
+// }
+
+// void lockDoorAndConfirm() {
+//   Serial.println("🔒 Locking door...");
+//   digitalWrite(RELAY, HIGH);
+//   digitalWrite(GREEN_LED, LOW);
+//   digitalWrite(RED_LED, HIGH);
+//   sendDoorClosed();
+// }
+
+// void sendDoorClosed() {
+//   DynamicJsonDocument doc(128);
+//   doc["msgType"] = "isunlock";
+//   JsonObject data = doc.createNestedObject("data");
+//   data["isUnlock"] = false;
+//   data["timestamp"] = getTimestamp();
+
+//   String msg;
+//   serializeJson(doc, msg);
+//   webSocket.sendTXT(msg);
+//   Serial.println("📤 Sent door closed event to server: " + msg);
+// }
+
+// void sendDoorOpened() {
+//   DynamicJsonDocument doc(128);
+//   doc["msgType"] = "isunlock";
+//   JsonObject data = doc.createNestedObject("data");
+//   data["isUnlock"] = true;
+//   data["timestamp"] = getTimestamp();
+
+//   String msg;
+//   serializeJson(doc, msg);
+//   webSocket.sendTXT(msg);
+//   Serial.println("📤 Sent door OPENED event to server: " + msg);
+// }
+
+// void playBeep() {
+//   for (int i = 0; i < 3; i++) {
+//     digitalWrite(BUZZER, HIGH);
+//     delay(100);
+//     digitalWrite(BUZZER, LOW);
+//     delay(100);
+//   }
+// }
+
+// void webSocketEvent(WStype_t type, uint8_t *payload, size_t length) {
+//   switch (type) {
+//     case WStype_CONNECTED:
+//       Serial.println("🔗 WebSocket connected");
+//       break;
+//     case WStype_TEXT:
+//       Serial.printf("📩 Message: %s\n", (char*)payload);
+//       if (String((char*)payload).indexOf("door unlocked") >= 0) {
+//         unlockDoor();
+//       }
+//       break;
+//     case WStype_DISCONNECTED:
+//       Serial.println("⚠️ WebSocket disconnected. Waiting 1 min to retry...");
+//       delay(60000);
+//       if (getToken()) startWebSocket();
+//       break;
+//     case WStype_ERROR:
+//       Serial.println("❌ WebSocket Error!");
+//       break;
+//     default:
+//       Serial.print("ℹ️ WebSocket Event Type: ");
+//       Serial.println(type);
+//       break;
+//   }
+// }
+
+// bool getToken() {
+//   WiFiClient client;
+//   HTTPClient http;
+
+//   String url = String("http://") + serverHost + ":" + serverPort + authEndpoint;
+//   http.begin(client, url);
+//   http.addHeader("Content-Type", "application/json");
+
+//   DynamicJsonDocument body(256);
+//   body["connType"] = "door-lock";
+//   body["id"] = deviceId;
+//   body["connId"] = JsonArray();
+//   body["apiKey"] = apiKey;
+//   body["branchId"] = branchId;
+
+//   String requestBody;
+//   serializeJson(body, requestBody);
+//   Serial.print("\n🔑 Sending token request: ");
+//   Serial.println(requestBody);
+
+//   int httpCode = http.POST(requestBody);
+//   if (httpCode == 200) {
+//     String response = http.getString();
+//     Serial.println("✅ Token response: " + response);
+
+//     DynamicJsonDocument responseDoc(256);
+//     DeserializationError error = deserializeJson(responseDoc, response);
+//     if (!error && responseDoc.containsKey("token")) {
+//       token = responseDoc["token"].as<String>();
+//       Serial.println("🔐 Parsed token: " + token);
+//       return true;
+//     } else {
+//       Serial.println("❌ Token parse error");
+//     }
+//   } else {
+//     Serial.printf("❌ HTTP POST failed, code: %d\n", httpCode);
+//   }
+
+//   http.end();
+//   return false;
+// }
+
+// void startWebSocket() {
+//   String fullPath = String(wsPath) + "?token=" + token;
+//   Serial.print("🔌 Connecting to WebSocket at: ");
+//   Serial.println("ws://" + String(serverHost) + ":" + String(serverPort) + fullPath);
+
+//   webSocket.begin(serverHost, serverPort, fullPath);
+//   webSocket.onEvent(webSocketEvent);
+//   webSocket.setReconnectInterval(5000);
+// }
+
+// String getTimestamp() {
+//   struct tm timeinfo;
+//   if (!getLocalTime(&timeinfo)) {
+//     Serial.println("⚠️ Failed to get local time. Using fallback.");
+//     return "2025-04-10T00:00:00Z";
+//   }
+//   char isoTime[30];
+//   strftime(isoTime, sizeof(isoTime), "%Y-%m-%dT%H:%M:%SZ", &timeinfo);
+//   return String(isoTime);
+// }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+//finalv4
+// #include <ESP8266WiFi.h>
+// #include <WebSocketsClient.h>
+// #include <ArduinoJson.h>
+// #include <ESP8266HTTPClient.h>
+// #include <time.h>
+// #include <PubSubClient.h>  // For remote debug MQTT
+
+// // -----------------------------------------------------
+// // Pin Definitions (unchanged from finalv3)
+// // -----------------------------------------------------
+// #define RELAY       D1
+// #define BUZZER      D8
+// #define IR_SENSOR   D2
+// #define RED_LED     D5
+// #define GREEN_LED   D6
+// #define DOOR_SENSOR D7
+
+// // -----------------------------------------------------
+// // WiFi Credentials
+// // -----------------------------------------------------
+// const char* ssid     = "DataStream_2.4";
+// const char* password = "armmd123!@#";
+
+// // -----------------------------------------------------
+// // Server Configuration (for auth and WebSocket)
+// // -----------------------------------------------------
+// const char* serverHost   = "54.255.15.253";
+// const int   serverPort   = 8081;
+// const char* authEndpoint = "/ws-auth";
+// const char* wsPath       = "/ws";
+
+// // -----------------------------------------------------
+// // Auth Config (for token request)
+// // -----------------------------------------------------
+// String apiKey = "K05uCc5QVyD2iA2WpU3kAaR6PLLFi6X4aBzdiit3xkQ=";
+// int branchId  = 1;
+// int deviceId  = 1;
+
+// // -----------------------------------------------------
+// // NTP Configuration
+// // -----------------------------------------------------
+// const char* ntpServer       = "pool.ntp.org";
+// const long gmtOffset_sec    = 19800;
+// const int daylightOffset_sec = 0;
+
+// // -----------------------------------------------------
+// // Global Variables for WebSocket (finalv3 code)
+// // -----------------------------------------------------
+// WebSocketsClient webSocket;
+// String token = "";
+// bool doorUnlocking = false;
+
+// // -----------------------------------------------------
+// // Remote Debug MQTT Configuration
+// // We use the same HiveMQ server but a separate topic "debug/log"
+// // -----------------------------------------------------
+// const char* debug_mqtt_server = "d681a6e1fecb4f01b1b5a72d2676e082.s1.eu.hivemq.cloud";
+// const int   debug_mqtt_port   = 8883;
+// const char* debug_mqtt_user   = "esplogger_1";
+// const char* debug_mqtt_pass   = "Esplogger2025";
+// const char* debugTopic        = "debug/log";
+
+// WiFiClientSecure debugWiFiClient;
+// PubSubClient debugMqttClient(debugWiFiClient);
+
+// // -----------------------------------------------------
+// // Global variable for remote debug free heap logging
+// // -----------------------------------------------------
+// unsigned long lastHeapPrint = 0;
+
+// // -----------------------------------------------------
+// // Remote Debug Functions
+// // -----------------------------------------------------
+
+// // Connect to the debug MQTT broker.
+// void connectToDebugMQTT() {
+//   debugWiFiClient.setInsecure(); // Accept server cert without verification (minimal overhead)
+//   debugMqttClient.setServer(debug_mqtt_server, debug_mqtt_port);
+//   while (!debugMqttClient.connected()) {
+//     Serial.println("[DEBUG] Connecting to debug MQTT...");
+//     if (debugMqttClient.connect("esp8266-debug", debug_mqtt_user, debug_mqtt_pass)) {
+//       Serial.println("[DEBUG] Debug MQTT connected");
+//     } else {
+//       Serial.println("[DEBUG] Debug MQTT connection failed. Retrying in 5s...");
+//       delay(5000);
+//     }
+//   }
+// }
+
+// // Publish a debug message remotely and also print locally.
+// void remoteDebugLog(String msg) {
+//   Serial.println(msg);
+//   if (debugMqttClient.connected()) {
+//     debugMqttClient.publish(debugTopic, msg.c_str());
+//   }
+// }
+
+// // -----------------------------------------------------
+// // Original finalv3 Code (unchanged except for added debug calls)
+// // -----------------------------------------------------
+
+// void setup() {
+//   Serial.begin(115200);
+//   delay(1000);
+
+//   // Set Pin Modes
+//   pinMode(RELAY, OUTPUT);
+//   pinMode(BUZZER, OUTPUT);
+//   pinMode(IR_SENSOR, INPUT_PULLUP);
+//   pinMode(RED_LED, OUTPUT);
+//   pinMode(GREEN_LED, OUTPUT);
+//   pinMode(DOOR_SENSOR, INPUT_PULLUP);
+
+//   digitalWrite(RELAY, HIGH);
+//   digitalWrite(RED_LED, HIGH);
+//   digitalWrite(GREEN_LED, LOW);
+
+//   Serial.println("\n🔧 Booting...");
+  
+//   // Connect to WiFi
+//   Serial.printf("📡 Connecting to WiFi: %s\n", ssid);
+//   WiFi.begin(ssid, password);
+//   while (WiFi.status() != WL_CONNECTED) {
+//     delay(500);
+//     Serial.print(".");
+//   }
+//   Serial.printf("\n✅ Connected! IP: %s\n", WiFi.localIP().toString().c_str());
+
+//   // Connect to remote debug MQTT
+//   connectToDebugMQTT();
+//   remoteDebugLog("[DEBUG] Remote debug MQTT connected");
+
+//   // Set up NTP time
+//   configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+//   Serial.println("⏱ Waiting for NTP time...");
+//   struct tm timeinfo;
+//   while (!getLocalTime(&timeinfo)) {
+//     Serial.println("❌ Failed to get time, retrying...");
+//     delay(1000);
+//   }
+//   Serial.println("✅ Time synchronized");
+
+//   // Get token and start WebSocket
+//   if (getToken()) {
+//     startWebSocket();
+//   } else {
+//     Serial.println("❌ Failed to get token. Restarting...");
+//     delay(1000);
+//     ESP.restart();
+//   }
+// }
+
+// void loop() {
+//   webSocket.loop();
+//   debugMqttClient.loop(); // Maintain remote debug MQTT connection
+
+//   // Every 5 seconds, send free heap value via remote debug
+//   if (millis() - lastHeapPrint > 5000) {
+//     remoteDebugLog("[DEBUG] Free heap: " + String(ESP.getFreeHeap()));
+//     lastHeapPrint = millis();
+//   }
+
+//   // Process door unlocking via IR sensor trigger
+//   if (!doorUnlocking && digitalRead(IR_SENSOR) == LOW) {
+//     Serial.println("🚪 IR Sensor Triggered - Unlocking");
+//     doorUnlocking = true;
+//     unlockDoor();
+//     doorUnlocking = false;
+//   }
+// }
+
+// bool isDoorClosed() {
+//   int state = digitalRead(DOOR_SENSOR);
+//   Serial.printf("🔍 Door Sensor State: %d (%s)\n", state, state == LOW ? "CLOSED" : "OPEN");
+//   return state == LOW;
+// }
+
+// void unlockDoor() {
+//   Serial.println("🔓 Unlocking door...");
+//   digitalWrite(RELAY, LOW);
+//   digitalWrite(GREEN_LED, HIGH);
+//   digitalWrite(RED_LED, LOW);
+//   playBeep();
+
+//   // Wait for door to open (magnet separated)
+//   Serial.println("⏳ Waiting for door to open...");
+//   unsigned long startTime = millis();
+//   while (isDoorClosed()) {
+//     if (millis() - startTime > 10000) {
+//       Serial.println("⌛ Timeout: Door not opened. Re-locking...");
+//       lockDoorAndConfirm();
+//       return;
+//     }
+//     delay(300);
+//   }
+//   Serial.println("✅ Door opened (magnet separated)");
+//   sendDoorOpened();
+
+//   // Wait for door to close (magnet in contact)
+//   Serial.println("⏳ Waiting for door to close...");
+//   while (!isDoorClosed()) {
+//     delay(300);
+//   }
+//   Serial.println("✅ Door closed (magnet contact)");
+//   lockDoorAndConfirm();
+// }
+
+// void lockDoorAndConfirm() {
+//   Serial.println("🔒 Locking door...");
+//   digitalWrite(RELAY, HIGH);
+//   digitalWrite(GREEN_LED, LOW);
+//   digitalWrite(RED_LED, HIGH);
+//   sendDoorClosed();
+// }
+
+// void sendDoorClosed() {
+//   DynamicJsonDocument doc(128);
+//   doc["msgType"] = "isunlock";
+//   JsonObject data = doc.createNestedObject("data");
+//   data["isUnlock"] = false;
+//   data["timestamp"] = getTimestamp();
+
+//   String msg;
+//   serializeJson(doc, msg);
+//   webSocket.sendTXT(msg);
+//   Serial.println("📤 Sent door closed event to server: " + msg);
+// }
+
+// void sendDoorOpened() {
+//   DynamicJsonDocument doc(128);
+//   doc["msgType"] = "isunlock";
+//   JsonObject data = doc.createNestedObject("data");
+//   data["isUnlock"] = true;
+//   data["timestamp"] = getTimestamp();
+
+//   String msg;
+//   serializeJson(doc, msg);
+//   webSocket.sendTXT(msg);
+//   Serial.println("📤 Sent door OPENED event to server: " + msg);
+// }
+
+// void playBeep() {
+//   for (int i = 0; i < 3; i++) {
+//     digitalWrite(BUZZER, HIGH);
+//     delay(100);
+//     digitalWrite(BUZZER, LOW);
+//     delay(100);
+//   }
+// }
+
+// void webSocketEvent(WStype_t type, uint8_t *payload, size_t length) {
+//   switch (type) {
+//     case WStype_CONNECTED:
+//       Serial.println("🔗 WebSocket connected");
+//       break;
+//     case WStype_TEXT:
+//       Serial.printf("📩 Message: %s\n", (char*)payload);
+//       if (String((char*)payload).indexOf("door unlocked") >= 0) {
+//         unlockDoor();
+//       }
+//       break;
+//     case WStype_DISCONNECTED:
+//       Serial.println("⚠️ WebSocket disconnected. Waiting 1 min to retry...");
+//       delay(60000);
+//       if (getToken()) startWebSocket();
+//       break;
+//     case WStype_ERROR:
+//       Serial.println("❌ WebSocket Error!");
+//       break;
+//     default:
+//       Serial.print("ℹ️ WebSocket Event Type: ");
+//       Serial.println(type);
+//       break;
+//   }
+// }
+
+// bool getToken() {
+//   WiFiClient client;
+//   HTTPClient http;
+
+//   String url = String("http://") + serverHost + ":" + serverPort + authEndpoint;
+//   http.begin(client, url);
+//   http.addHeader("Content-Type", "application/json");
+
+//   DynamicJsonDocument body(256);
+//   body["connType"] = "door-lock";
+//   body["id"] = deviceId;
+//   body["connId"] = JsonArray();
+//   body["apiKey"] = apiKey;
+//   body["branchId"] = branchId;
+
+//   String requestBody;
+//   serializeJson(body, requestBody);
+//   Serial.print("\n🔑 Sending token request: ");
+//   Serial.println(requestBody);
+
+//   int httpCode = http.POST(requestBody);
+//   if (httpCode == 200) {
+//     String response = http.getString();
+//     Serial.println("✅ Token response: " + response);
+
+//     DynamicJsonDocument responseDoc(256);
+//     DeserializationError error = deserializeJson(responseDoc, response);
+//     if (!error && responseDoc.containsKey("token")) {
+//       token = responseDoc["token"].as<String>();
+//       Serial.println("🔐 Parsed token: " + token);
+//       return true;
+//     } else {
+//       Serial.println("❌ Token parse error");
+//     }
+//   } else {
+//     Serial.printf("❌ HTTP POST failed, code: %d\n", httpCode);
+//   }
+
+//   http.end();
+//   return false;
+// }
+
+// void startWebSocket() {
+//   String fullPath = String(wsPath) + "?token=" + token;
+//   Serial.print("🔌 Connecting to WebSocket at: ");
+//   Serial.println("ws://" + String(serverHost) + ":" + String(serverPort) + fullPath);
+
+//   webSocket.begin(serverHost, serverPort, fullPath);
+//   webSocket.onEvent(webSocketEvent);
+//   webSocket.setReconnectInterval(5000);
+// }
+
+// String getTimestamp() {
+//   struct tm timeinfo;
+//   if (!getLocalTime(&timeinfo)) {
+//     Serial.println("⚠️ Failed to get local time. Using fallback.");
+//     return "2025-04-10T00:00:00Z";
+//   }
+//   char isoTime[30];
+//   strftime(isoTime, sizeof(isoTime), "%Y-%m-%dT%H:%M:%SZ", &timeinfo);
+//   return String(isoTime);
+// }
 
 
 
