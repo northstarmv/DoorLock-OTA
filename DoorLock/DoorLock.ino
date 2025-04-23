@@ -43,6 +43,7 @@ String apiKey = "K05uCc5QVyD2iA2WpU3kAaR6PLLFi6X4aBzdiit3xkQ=";
 int branchId  = 1;
 int deviceId  = 1;
 
+
 //
 // NTP Config
 //
@@ -206,15 +207,19 @@ void unlockDoor() {
   digitalWrite(RED_LED, LOW);
   playBeep();
 
+  // doorLog("⏳ Waiting open…");
+  // unsigned long st = millis();
+  // while (isDoorClosed()) {
+  //   if (millis() - st > 10000) {
+  //     doorLog("⌛ Timeout; re-lock");
+  //     lockDoorAndConfirm();
+  //     return;
+  //   }
+  //   delay(300);
+  // }
   doorLog("⏳ Waiting open…");
-  unsigned long st = millis();
   while (isDoorClosed()) {
-    if (millis() - st > 10000) {
-      doorLog("⌛ Timeout; re-lock");
-      lockDoorAndConfirm();
-      return;
-    }
-    delay(300);
+    delay(300);  // Wait indefinitely until door is opened
   }
   doorLog("✅ Opened");
   sendDoorOpened();
@@ -277,11 +282,23 @@ void webSocketEvent(WStype_t type, uint8_t *payload, size_t length) {
       if (msg.indexOf("door unlocked") >= 0) unlockDoor();
       break;
     }
+    // case WStype_DISCONNECTED:
+    //   doorLog("⚠️ WS disconnected; retry in 15seconds");
+    //   delay(15000);
+    //   if (getToken()) startWebSocket();
+    //   break;
     case WStype_DISCONNECTED:
-      doorLog("⚠️ WS disconnected; retry in 1m");
-      delay(60000);
-      if (getToken()) startWebSocket();
+      doorLog("⚠️ WS disconnected; full reconnect in 15s");
+      delay(15000); // Reconnect faster than 1 minute
+
+      httpServer.end();                 // Fully restart the web server
+      httpServer.begin();              //
+      ElegantOTA.begin(&httpServer);   // Rebind OTA handler
+      connectToDebugMQTT();            // Reconnect MQTT (HiveMQ)
+
+      if (getToken()) startWebSocket(); // Re-establish WebSocket connection
       break;
+
     case WStype_ERROR:
       doorLog("❌ WS error");
       break;
